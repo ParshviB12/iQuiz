@@ -21,9 +21,14 @@ final class QuizListViewController: UITableViewController {
         title = "iQuiz"
         print("✅ QuizListViewController loaded")
 
-        // Start with fallback so app works offline
-        quizzes = fallbackQuizzes()
-
+        // Start with cached quizzes if possible (best offline behavior), otherwise fallback
+        if let cached = try? QuizCache.load(),
+           let decoded = try? decodeQuizzes(from: cached) {
+            quizzes = decoded
+        } else {
+            quizzes = fallbackQuizzes()
+        }
+        
         // Attempt initial download
         fetchQuizzes(showSuccessAlert: false)
     }
@@ -125,7 +130,7 @@ final class QuizListViewController: UITableViewController {
 
     private struct QuestionDTO: Codable {
         let text: String
-        let answer: String      // "1", "2", ... (1-based index)
+        let answer: String
         let answers: [String]
     }
 
@@ -139,55 +144,84 @@ final class QuizListViewController: UITableViewController {
         let url = currentURL()
 
         URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            guard let self = self else { return }
 
-            // If network fails, show alert (counts as "notify users network not available")
             if let error = error {
                 DispatchQueue.main.async {
-                    self?.showAlert(title: "Network Error", message: error.localizedDescription)
+                    self.showAlert(title: "Network Error", message: error.localizedDescription)
                 }
+
+                // Part 4: load cached quizzes if available
+                self.loadFromCacheAndUpdateUI()
                 return
             }
 
             guard let data = data else {
                 DispatchQueue.main.async {
-                    self?.showAlert(title: "Error", message: "No data returned.")
+                    self.showAlert(title: "Error", message: "No data returned.")
                 }
+
+                // Part 4: fallback to cache too
+                self.loadFromCacheAndUpdateUI()
                 return
             }
 
             do {
-                let dtos = try JSONDecoder().decode([QuizDTO].self, from: data)
+                let converted = try self.decodeQuizzes(from: data)
 
-                let converted: [Quiz] = dtos.map { dto in
-                    Quiz(
-                        title: dto.title,
-                        desc: dto.desc,
-                        iconName: self?.iconName(for: dto.title) ?? "science",
-                        questions: dto.questions.map { qdto in
-                            // Convert "1"-based string to 0-based Int for your app
-                            let oneBased = Int(qdto.answer) ?? 1
-                            let correctIndex = max(0, oneBased - 1)
-                            return Question(text: qdto.text, answers: qdto.answers, correctIndex: correctIndex)
-                        }
-                    )
-                }
+                // Part 4: save the raw JSON we successfully downloaded
+                try? QuizCache.save(data)
 
                 DispatchQueue.main.async {
-                    self?.quizzes = converted
-                    self?.tableView.reloadData()
+                    self.quizzes = converted
+                    self.tableView.reloadData()
 
                     if showSuccessAlert {
-                        self?.showAlert(title: "Updated", message: "Downloaded \(converted.count) quizzes.")
+                        self.showAlert(title: "Updated", message: "Downloaded \(converted.count) quizzes.")
                     }
                 }
-
             } catch {
+                // Keep Part 3 decode popup
                 DispatchQueue.main.async {
-                    self?.showAlert(title: "Decode Error", message: error.localizedDescription)
+                    self.showAlert(title: "Decode Error", message: error.localizedDescription)
                 }
-            }
 
+                // Part 4: try cache if decode fails
+                self.loadFromCacheAndUpdateUI()
+            }
         }.resume()
+    }
+    private func decodeQuizzes(from data: Data) throws -> [Quiz] {
+        let dtos = try JSONDecoder().decode([QuizDTO].self, from: data)
+
+        return dtos.map { dto in
+            Quiz(
+                title: dto.title,
+                desc: dto.desc,
+                iconName: iconName(for: dto.title),
+                questions: dto.questions.map { qdto in
+                    let oneBased = Int(qdto.answer) ?? 1
+                    let correctIndex = max(0, oneBased - 1)
+                    return Question(text: qdto.text, answers: qdto.answers, correctIndex: correctIndex)
+                }
+            )
+        }
+    }
+    
+    private func loadFromCacheAndUpdateUI() {
+        do {
+            let cachedData = try QuizCache.load()
+            let cachedQuizzes = try decodeQuizzes(from: cachedData)
+
+            DispatchQueue.main.async {
+                self.quizzes = cachedQuizzes
+                self.tableView.reloadData()
+                
+            }
+        } catch {
+            // If there's no cache yet, just do nothing (you already show an alert)
+            // and your app will still display fallbackQuizzes from viewDidLoad.
+        }
     }
 
     private func iconName(for title: String) -> String {
